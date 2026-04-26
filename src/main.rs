@@ -25,7 +25,7 @@ use axum::{
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::{Html, IntoResponse, Json},
+    response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
@@ -2154,23 +2154,7 @@ async fn handle_ws_conn(socket: WebSocket, state: Arc<AppState>, p: WsQ) {
     send.abort();
 }
 
-async fn serve_index() -> impl IntoResponse {
-    // Try index.html next to the executable (Windows packaging often runs from target dir)
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            let path = parent.join("index.html");
-            if let Ok(html) = tokio::fs::read_to_string(path).await {
-                return Html(html).into_response();
-            }
-        }
-    }
-    // Fallback to working directory index.html
-    if let Ok(html) = tokio::fs::read_to_string("index.html").await {
-        return Html(html).into_response();
-    }
-    // Final fallback to embedded HTML
-    Html(INDEX_HTML).into_response()
-}
+
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -2222,7 +2206,7 @@ async fn main() {
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     let app  = Router::new()
-        .route("/",                  get(serve_index))
+        .route("/",                  get(h_health))
         .route("/health",            get(h_health))
         .route("/api/trades",        get(h_trades))
         .route("/api/markets",       get(h_markets))
@@ -2257,5 +2241,3 @@ async fn main() {
 
     axum::serve(listener, app).await.unwrap();
 }
-
-static INDEX_HTML: &str = include_str!("../index.html"); // Changed from "../index.html"
