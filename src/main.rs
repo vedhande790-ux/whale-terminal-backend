@@ -576,12 +576,17 @@ pub struct LeaderboardEntry {
 }
 // ─── Supabase License Client ───────────────────────────────────────────────────
 
-fn supabase_url() -> String {
-    // Strip trailing slash so format!("{}/rest/v1/...") is always clean
-    std::env::var("SUPABASE_URL")
-        .expect("SUPABASE_URL not set")
-        .trim_end_matches('/')
-        .to_string()
+fn supabase_base() -> String {
+    // Normalize env var — handles both:
+    //   "https://xxx.supabase.co"           → https://xxx.supabase.co/rest/v1
+    //   "https://xxx.supabase.co/rest/v1"   → https://xxx.supabase.co/rest/v1
+    let raw = std::env::var("SUPABASE_URL").expect("SUPABASE_URL not set");
+    let s = raw.trim_end_matches('/');
+    let s = if s.ends_with("/rest/v1") { &s[..s.len()-8] } else { s };
+    let s = s.trim_end_matches('/');
+    let base = format!("{}/rest/v1", s);
+    println!("[supabase] base = {}", base);
+    base
 }
 fn supabase_key() -> String {
     std::env::var("SUPABASE_KEY").expect("SUPABASE_KEY not set")
@@ -607,7 +612,7 @@ async fn db_insert_license(
     key: &str,
     expires_at: Option<&str>,
 ) -> Result<(), String> {
-    let url = format!("{}/rest/v1/licenses", supabase_url());
+    let url = format!("{}/licenses", supabase_base());
     let body = serde_json::json!({
         "key": key,
         "device_id": serde_json::Value::Null,
@@ -644,8 +649,8 @@ async fn db_lookup_license(
     key: &str,
 ) -> Result<Option<SupabaseLicense>, String> {
     let url = format!(
-        "{}/rest/v1/licenses?key=eq.{}&limit=1",
-        supabase_url(),
+        "{}/licenses?key=eq.{}&limit=1",
+        supabase_base(),
         url_encode(key)
     );
 
