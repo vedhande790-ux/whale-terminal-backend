@@ -577,7 +577,11 @@ pub struct LeaderboardEntry {
 // ─── Supabase License Client ───────────────────────────────────────────────────
 
 fn supabase_url() -> String {
-    std::env::var("SUPABASE_URL").expect("SUPABASE_URL not set")
+    // Strip trailing slash so format!("{}/rest/v1/...") is always clean
+    std::env::var("SUPABASE_URL")
+        .expect("SUPABASE_URL not set")
+        .trim_end_matches('/')
+        .to_string()
 }
 fn supabase_key() -> String {
     std::env::var("SUPABASE_KEY").expect("SUPABASE_KEY not set")
@@ -609,21 +613,29 @@ async fn db_insert_license(
         "device_id": serde_json::Value::Null,
         "expires_at": expires_at,
     });
+
+    println!("[supabase] POST {}", url);
+    println!("[supabase] body = {}", body);
+
     let res = client
         .post(&url)
         .header("apikey", supabase_key())
         .header("Authorization", format!("Bearer {}", supabase_key()))
         .header("Content-Type", "application/json")
         .header("Prefer", "return=minimal")
-        .json(&body)
+        .body(body.to_string())   // raw body, not .json() wrapper
         .send()
         .await
         .map_err(|e| e.to_string())?;
 
-    if res.status().is_success() {
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    println!("[supabase] insert response {} — {}", status, text);
+
+    if status.is_success() {
         Ok(())
     } else {
-        Err(format!("insert failed: {}", res.status()))
+        Err(format!("insert failed: {} — {}", status, text))
     }
 }
 
@@ -636,6 +648,9 @@ async fn db_lookup_license(
         supabase_url(),
         url_encode(key)
     );
+
+    println!("[supabase] GET {}", url);
+
     let res = client
         .get(&url)
         .header("apikey", supabase_key())
@@ -645,7 +660,16 @@ async fn db_lookup_license(
         .await
         .map_err(|e| e.to_string())?;
 
-    let rows: Vec<SupabaseLicense> = res.json().await.map_err(|e| e.to_string())?;
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    println!("[supabase] lookup response {} — {}", status, text);
+
+    if !status.is_success() {
+        return Err(format!("lookup failed: {} — {}", status, text));
+    }
+
+    let rows: Vec<SupabaseLicense> = serde_json::from_str(&text)
+        .map_err(|e| format!("parse error: {e} — raw: {text}"))?;
     Ok(rows.into_iter().next())
 }
 
