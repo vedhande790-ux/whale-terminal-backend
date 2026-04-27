@@ -41,7 +41,6 @@ use std::{
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungMsg};
 use tower_http::cors::{Any, CorsLayer};
-use std::fs;
 
 // ─── API endpoints ─────────────────────────────────────────────────────────────
 const GAMMA_API: &str  = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&order=volume24hr&ascending=false";
@@ -575,87 +574,79 @@ pub struct LeaderboardEntry {
     pub period:   String,
 
 }
+// ─── Supabase License Client ───────────────────────────────────────────────────
+
+fn supabase_url() -> String {
+    std::env::var("SUPABASE_URL").expect("SUPABASE_URL not set")
+}
+fn supabase_key() -> String {
+    std::env::var("SUPABASE_KEY").expect("SUPABASE_KEY not set")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LicenseRecord {
-    pub expires:   String,       // "YYYY-MM-DD" | "LIFETIME"
-    pub active:    bool,
-    pub devices:   Vec<String>,  // bound device IDs (1 = ok, 2 = warn, 3+ = reject)
-    pub last_ips:  Vec<String>,  // last 10 unique IPs
-    pub issued_at: i64,
-    #[serde(default)]
-    pub issued_to: String,
+struct SupabaseLicense {
+    key:        String,
+    device_id:  Option<String>,
+    expires_at: Option<String>,
+    created_at: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct LicenseStore {
-    keys: HashMap<String, LicenseRecord>,
+fn url_encode(s: &str) -> String {
+    s.chars().map(|c| match c {
+        'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+        _ => format!("%{:02X}", c as u32),
+    }).collect()
 }
 
-impl LicenseStore {
-    fn load() -> Self {
-        match fs::read_to_string("licenses.json") {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("[license] parse error: {e}");
-                Self::default()
-            }),
-            Err(_) => {
-                let s = Self::default();
-                s.save();
-                println!("[license] licenses.json not found — created empty store");
-                s
-            }
-        }
+async fn db_insert_license(
+    client: &reqwest::Client,
+    key: &str,
+    expires_at: Option<&str>,
+) -> Result<(), String> {
+    let url = format!("{}/rest/v1/licenses", supabase_url());
+    let body = serde_json::json!({
+        "key": key,
+        "device_id": serde_json::Value::Null,
+        "expires_at": expires_at,
+    });
+    let res = client
+        .post(&url)
+        .header("apikey", supabase_key())
+        .header("Authorization", format!("Bearer {}", supabase_key()))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "return=minimal")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("insert failed: {}", res.status()))
     }
+}
 
-    fn save(&self) {
-        match serde_json::to_string_pretty(self) {
-            Ok(s) => { let _ = fs::write("licenses.json", s); }
-            Err(e) => eprintln!("[license] save error: {e}"),
-        }
-    }
+async fn db_lookup_license(
+    client: &reqwest::Client,
+    key: &str,
+) -> Result<Option<SupabaseLicense>, String> {
+    let url = format!(
+        "{}/rest/v1/licenses?key=eq.{}&limit=1",
+        supabase_url(),
+        url_encode(key)
+    );
+    let res = client
+        .get(&url)
+        .header("apikey", supabase_key())
+        .header("Authorization", format!("Bearer {}", supabase_key()))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
 
-    // Returns (valid, status, expires, warning)
-    fn validate(&mut self, key: &str, device: &str, ip: &str) -> (bool, &'static str, String, &'static str) {
-        let rec = match self.keys.get_mut(key) {
-            None    => return (false, "INVALID", String::new(), ""),
-            Some(r) => r,
-        };
-
-        if !rec.active {
-            return (false, "INACTIVE", String::new(), "");
-        }
-
-        let expired = if rec.expires == "LIFETIME" {
-            false
-        } else {
-            chrono::NaiveDate::parse_from_str(&rec.expires, "%Y-%m-%d")
-                .map(|d| d < chrono::Utc::now().naive_utc().date())
-                .unwrap_or(true)
-        };
-        if expired {
-            return (false, "EXPIRED", rec.expires.clone(), "");
-        }
-
-        let expires = rec.expires.clone();
-
-        if !rec.devices.contains(&device.to_string()) {
-            rec.devices.push(device.to_string());
-        }
-        let n = rec.devices.len();
-
-        if !ip.is_empty() && !rec.last_ips.contains(&ip.to_string()) {
-            if rec.last_ips.len() >= 10 { rec.last_ips.remove(0); }
-            rec.last_ips.push(ip.to_string());
-        }
-
-        self.save();
-
-        match n {
-            0..=1 => (true,  "ACTIVE",          expires, ""),
-            2     => (true,  "ACTIVE",          expires, "multiple_devices"),
-            _     => (false, "TOO_MANY_DEVICES", expires, ""),
-        }
-    }
+    let rows: Vec<SupabaseLicense> = res.json().await.map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().next())
 }
 
 
@@ -715,7 +706,7 @@ impl SignalDedup {
 
 pub struct AppState {
     pub tx:                broadcast::Sender<Ev>,
-    license_store:         Mutex<LicenseStore>,
+    pub http_client:       reqwest::Client,
     pub markets:           RwLock<Vec<Market>>,
     pub recent_trades:     Mutex<VecDeque<Trade>>,
     pub books:             Mutex<HashMap<String, MarketBook>>,
@@ -760,21 +751,32 @@ struct ValidateParams { key: String, device: String }
 async fn h_validate(
     State(s): State<Arc<AppState>>,
     Query(p): Query<ValidateParams>,
-    headers:  axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
 ) -> Json<serde_json::Value> {
-    let key    = p.key.trim().to_uppercase();
-    let device = p.device.trim().to_string();
-    if key.len() < 8 || device.is_empty() {
+    let key = p.key.trim().to_uppercase();
+    if key.len() < 8 {
         return Json(serde_json::json!({"valid":false,"status":"INVALID","expires":"","warning":""}));
     }
-    let ip = headers.get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
-        .unwrap_or_default();
-    let mut store = s.license_store.lock().unwrap();
-    let (valid, status, expires, warning) = store.validate(&key, &device, &ip);
-    Json(serde_json::json!({"valid":valid,"status":status,"expires":expires,"warning":warning}))
+    match db_lookup_license(&s.http_client, &key).await {
+        Ok(Some(rec)) => {
+            let expired = rec.expires_at.as_deref().map(|exp| {
+                if exp == "LIFETIME" { return false; }
+                chrono::NaiveDate::parse_from_str(exp, "%Y-%m-%d")
+                    .map(|d| d < chrono::Utc::now().naive_utc().date())
+                    .unwrap_or(true)
+            }).unwrap_or(false);
+            if expired {
+                Json(serde_json::json!({"valid":false,"status":"EXPIRED","expires":rec.expires_at,"warning":""}))
+            } else {
+                Json(serde_json::json!({"valid":true,"status":"ACTIVE","expires":rec.expires_at,"warning":""}))
+            }
+        }
+        Ok(None) => Json(serde_json::json!({"valid":false,"status":"INVALID","expires":"","warning":""})),
+        Err(e) => {
+            eprintln!("[license] validate error: {e}");
+            Json(serde_json::json!({"valid":false,"status":"ERROR","expires":"","warning":""}))
+        }
+    }
 }
 
 async fn h_payment_info() -> Json<serde_json::Value> {
@@ -805,7 +807,7 @@ IMPORTANT:\n\
 }
 
 #[derive(Deserialize)]
-struct GenKeyParams { secret: String, expires: Option<String>, issued_to: Option<String> }
+struct GenKeyParams { secret: String, expires: Option<String> }
 
 async fn h_gen_key(
     State(s): State<Arc<AppState>>,
@@ -819,28 +821,33 @@ async fn h_gen_key(
     let suffix: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
         .take(6).map(char::from).collect::<String>().to_uppercase();
-    let today   = chrono::Utc::now().format("%Y-%m-%d");
-    let key     = format!("Whale-PRO-{today}-{suffix}");
-    let expires = p.expires.unwrap_or_else(|| "LIFETIME".into());
-    let rec = LicenseRecord {
-        expires: expires.clone(), active: true,
-        devices: vec![], last_ips: vec![],
-        issued_at: chrono::Utc::now().timestamp(),
-        issued_to: p.issued_to.unwrap_or_default(),
-    };
-    { let mut store = s.license_store.lock().unwrap(); store.keys.insert(key.clone(), rec); store.save(); }
-    println!("[admin] key={key} expires={expires}");
-    Json(serde_json::json!({"key":key,"expires":expires}))
+    let today  = chrono::Utc::now().format("%Y-%m-%d");
+    let key    = format!("Whale-PRO-{today}-{suffix}");
+    let expires = p.expires.as_deref();
+
+    match db_insert_license(&s.http_client, &key, expires).await {
+        Ok(()) => {
+            println!("[admin] key={key} expires={:?}", expires);
+            Json(serde_json::json!({"key": key, "expires": expires}))
+        }
+        Err(e) => {
+            eprintln!("[admin] insert error: {e}");
+            Json(serde_json::json!({"error": "failed to store key", "detail": e}))
+        }
+    }
 }
 
 impl AppState {
     fn new(tx: broadcast::Sender<Ev>) -> Self {
         Self {
             tx,
+            http_client:       reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap(),
             markets:           RwLock::new(vec![]),
             recent_trades:     Mutex::new(VecDeque::new()),
             books:             Mutex::new(HashMap::new()),
-            license_store: Mutex::new(LicenseStore::load()),
             raw_books:         Mutex::new(HashMap::new()),
             whale_profiles:    Mutex::new(HashMap::new()),
             leaderboard_month: Mutex::new(vec![]),
