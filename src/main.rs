@@ -649,7 +649,7 @@ async fn db_lookup_license(
     key: &str,
 ) -> Result<Option<SupabaseLicense>, String> {
     let url = format!(
-        "{}/licenses?key=eq.{}&limit=1",
+        "{}/licenses?key=ilike.{}&limit=1",
         supabase_base(),
         url_encode(key)
     );
@@ -782,7 +782,7 @@ async fn h_validate(
     Query(p): Query<ValidateParams>,
     _headers: axum::http::HeaderMap,
 ) -> Json<serde_json::Value> {
-    let key = p.key.trim().to_uppercase();
+    let key = p.key.trim().to_string();
     if key.len() < 8 {
         return Json(serde_json::json!({"valid":false,"status":"INVALID","expires":"","warning":""}));
     }
