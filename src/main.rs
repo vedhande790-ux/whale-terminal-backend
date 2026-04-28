@@ -44,7 +44,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as TungMsg};
 use tower_http::cors::{Any, CorsLayer};
 
 // ─── API endpoints ─────────────────────────────────────────────────────────────
-const GAMMA_API: &str  = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&order=volume24hr&ascending=false";
+const GAMMA_API: &str  = "https://gamma-api.polymarket.com/markets?active=true&closed=false&archived=false&limit=100";
 const DATA_TRADES: &str = "https://data-api.polymarket.com/trades?limit=100&takerOnly=false";
 const DATA_LB: &str    = "https://data-api.polymarket.com/v1/leaderboard?limit=25&timePeriod=MONTH";
 const DATA_LB_ALL: &str= "https://data-api.polymarket.com/v1/leaderboard?limit=25&timePeriod=ALL";
@@ -1369,7 +1369,7 @@ fn run_signals_on_trade(state: &Arc<AppState>, trade: &Trade) {
 // ─── Task: Market loader ───────────────────────────────────────────────────────
 
 async fn task_load_markets(state: Arc<AppState>, client: reqwest::Client) {
-    let mut iv = tokio::time::interval(Duration::from_secs(120));
+    let mut iv = tokio::time::interval(Duration::from_secs(300));
     loop {
         iv.tick().await;
         load_markets(&state, &client).await;
@@ -1393,6 +1393,23 @@ async fn load_markets(state: &Arc<AppState>, client: &reqwest::Client) {
         if page_len < 100 { break; } // last page
         tokio::time::sleep(Duration::from_millis(300)).await; // be polite
     }
+    // Second pass: top volume markets (different sort = different set)
+    for page in 0..25usize {
+        let offset = page * 100;
+        let url = format!("https://gamma-api.polymarket.com/markets?active=true&closed=false&archived=false&limit=100&order=volume24hr&ascending=false&offset={}", offset);
+        let text = match client.get(&url).send().await {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(e) => { eprintln!("Gamma vol page {page}: {e}"); break; }
+        };
+        let page_raw: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
+        let page_len = page_raw.len();
+        raw.extend(page_raw);
+        if page_len < 100 { break; }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    // Dedupe by conditionId
+    let mut seen = std::collections::HashSet::new();
+    raw.retain(|v| seen.insert(v["conditionId"].as_str().unwrap_or("").to_string()));
     if raw.is_empty() { eprintln!("Gamma empty"); return; }
     let mut markets: Vec<Market> = vec![];
     for (i, v) in raw.iter().enumerate() {
@@ -1435,6 +1452,22 @@ async fn load_markets(state: &Arc<AppState>, client: &reqwest::Client) {
         });
     }
 
+    let now = chrono::Utc::now();
+    markets.retain(|m| {
+        // Drop expired by date
+        let date_ok = match &m.end_date {
+            Some(d) => chrono::DateTime::parse_from_rfc3339(d)
+                .map(|dt| dt > now)
+                .unwrap_or(true),
+            None => true,
+        };
+        // Drop effectively resolved markets — YES at 99¢+ or NO at 99¢+ means done
+        let not_resolved = !m.outcomes.iter().any(|o| o.price_cents >= 99.0);
+        // Drop zero-volume dead markets
+        let has_volume = m.volume_24h > 10.0;
+        date_ok && not_resolved && has_volume
+    });
+    
     if markets.is_empty() { eprintln!("No markets parsed"); return; }
     println!("✅  {} markets loaded", markets.len());
 
