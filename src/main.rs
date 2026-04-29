@@ -2312,8 +2312,8 @@ async fn main() {
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     let app  = Router::new()
-        .route("/",                  get(h_health))
         .route("/health",            get(h_health))
+        .route_service("/", tower_http::services::ServeFile::new("index.html"))
         .route("/api/trades",        get(h_trades))
         .route("/api/markets",       get(h_markets))
         .route("/api/books",         get(h_books))
