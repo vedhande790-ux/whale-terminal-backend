@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungMsg};
@@ -782,7 +782,10 @@ pub struct AppState {
     pub alert_window_secs: Mutex<u64>,
     pub alert_sound:       Mutex<bool>,
     pub whale_threshold:  Mutex<f64>,
+    // Trial tracking: device_id → first_seen unix timestamp (secs)
+    trial_registry:       Mutex<HashMap<String, i64>>,
 }
+
 
 #[derive(Default)]
 struct SeenSet { set: HashSet<String>, q: VecDeque<String> }
@@ -935,6 +938,7 @@ impl AppState {
             alert_window_secs: Mutex::new(90),
             alert_sound:       Mutex::new(false),
             whale_threshold:  Mutex::new(5_000.0),
+            trial_registry:   Mutex::new(HashMap::new()),
         }
     }
 
@@ -2168,7 +2172,7 @@ async fn h_set_threshold(State(s): State<Arc<AppState>>, Json(p): Json<Threshold
 // ─── WebSocket handler ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct WsQ { min_size: Option<f64>, whales_only: Option<bool> }
+struct WsQ { min_size: Option<f64>, whales_only: Option<bool>, device_id: Option<String> }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(s): State<Arc<AppState>>, Query(p): Query<WsQ>) -> impl IntoResponse {
     // Debug: track new WebSocket connections
@@ -2190,9 +2194,18 @@ pub struct EdgeFeedEvent {
 async fn handle_ws_conn(socket: WebSocket, state: Arc<AppState>, p: WsQ) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx  = state.tx.subscribe();
-    let start   = Instant::now();
     let min_sz  = p.min_size.unwrap_or(0.0);
     let whales  = p.whales_only.unwrap_or(false);
+
+    // ── Trial registry: tie trial to device_id, survives refreshes ──
+    let trial_start_secs: i64 = {
+        let dev = p.device_id.clone().unwrap_or_else(|| "unknown".to_string());
+        let mut reg = state.trial_registry.lock().unwrap();
+        let now_s = Utc::now().timestamp();
+        *reg.entry(dev).or_insert(now_s)  // first seen → locked in forever
+    };
+    // remaining = TRIAL_SECS - (now - first_seen). Never resets on reconnect.
+    let trial_elapsed = move || Utc::now().timestamp() - trial_start_secs;
 
     // Full snapshot on connect
     let snap = {
@@ -2207,7 +2220,7 @@ async fn handle_ws_conn(socket: WebSocket, state: Arc<AppState>, p: WsQ) {
         let sigs   = state.signals.lock().unwrap().clone();
         let books  = state.books.lock().unwrap().values().take(8).cloned().collect::<Vec<_>>();
         let edge   = state.edge_signals.lock().unwrap().iter().take(20).cloned().collect::<Vec<_>>();
-    let rem    = TRIAL_SECS as i64 - start.elapsed().as_secs() as i64;
+    let rem    = (TRIAL_SECS as i64 - trial_elapsed()).max(0);
     println!("WS: prepared Snapshot with trades={}, markets={}, whale_profiles= {}", trades.len(), markets.len(), profiles.len());
     serde_json::json!({
             "type": "Snapshot",
@@ -2224,7 +2237,7 @@ async fn handle_ws_conn(socket: WebSocket, state: Arc<AppState>, p: WsQ) {
 
     let send = tokio::spawn(async move {
         loop {
-            let rem = TRIAL_SECS as i64 - start.elapsed().as_secs() as i64;
+            let rem = (TRIAL_SECS as i64 - trial_elapsed()).max(0);
             if rem <= 0 {
                 let _ = sender.send(WsMsg::Text(serde_json::to_string(&Ev::TrialExpired).unwrap())).await;
                 break;
