@@ -415,13 +415,18 @@ fn compute_edge_feed(state: &AppState) -> Option<EdgeFeedEvent> {
     let mut score = 0.0f64;
     // Direction bias from whale activity
     let dir = if buy_recent > sell_recent { "BULLISH" } else if sell_recent > buy_recent { "BEARISH" } else { "NEUTRAL" };
-    if buy_recent > sell_recent { score += 4.0; } else if sell_recent > buy_recent { score += 4.0; }
+    // Directional: buy bias adds, sell bias subtracts
+    if buy_recent > sell_recent {
+        score += 4.0;
+    } else if sell_recent > buy_recent {
+        score -= 4.0;
+    }
     if liquidity_present { score += liquidity_score; }
     if composite > 60 { score += 1.5; }
     // Cap to 10
     if score > 10.0 { score = 10.0; }
 
-    if score < 6.0 { return None; }
+    if score.abs() < 6.0 { return None; }
 
     // Strength label
     let strength = match score as i32 {
@@ -539,10 +544,7 @@ pub struct GlobalSignals {
     pub signal_accuracy:    Vec<SignalAccuracy>,
     pub top_market:         String,
     pub hottest_outcome:    String,
-    // Time-based projections
-    pub proj_5m:    Option<f64>,   // expected probability move in 5m
-    pub proj_30m:   Option<f64>,
-    pub proj_1h:    Option<f64>,
+    // Projections removed — were derived from composite with no real predictive basis
     // Following top whales yield
     pub whale_follow_yield: f64,   // "Following top whales would yield X%"
 }
@@ -560,8 +562,7 @@ pub struct Stats {
     pub signals_fired_today: u32,
     pub alpha_wallet_count:  usize, // whale_score ≥ 70
     // Performance tracking
-    pub signals_7d:         u32,
-    pub signals_30d:        u32,
+    // signals_7d / signals_30d removed — were fabricated (fired_today * 7/30)
     pub whale_follow_yield: f64,   // simulated yield from following top whales
 }
 
@@ -727,6 +728,11 @@ struct MarketSignalState {
     // For MOMENTUM BREAK: last known prob before 25/50/75 cross
     last_prob:  f64,
     last_cross_ts: i64,
+    // For windowed prob change
+    price_5m_ago:  f64,
+    price_15m_ago: f64,
+    price_5m_ts:   i64,
+    price_15m_ts:  i64,
 }
 
 // ─── Dedup set for signals ──────────────────────────────────────────────────────
@@ -906,7 +912,6 @@ impl AppState {
                 confidence_score: 0,
                 signal_accuracy: vec![],
                 top_market: "—".into(), hottest_outcome: "—".into(),
-                proj_5m: None, proj_30m: None, proj_1h: None,
                 whale_follow_yield: 0.0,
             }),
             stats:             Mutex::new(Stats {
@@ -915,7 +920,7 @@ impl AppState {
                 total_trades_seen: 0, biggest_trade: 0.0,
                 buy_sell_ratio: 1.0, whale_count: 0,
                 signals_fired_today: 0, alpha_wallet_count: 0,
-                signals_7d: 0, signals_30d: 0, whale_follow_yield: 0.0,
+                whale_follow_yield: 0.0,
             }),
             edge_signals:      Mutex::new(VecDeque::new()),
             trade_counter:     Mutex::new(0),
@@ -1155,6 +1160,7 @@ fn run_signals_on_trade(state: &Arc<AppState>, trade: &Trade) {
         let avg_1m_baseline = ms.vol_60m / 60.0;
         if ms.vol_1m > avg_1m_baseline * 4.0 && ms.vol_1m > 1_500.0 && avg_1m_baseline > 0.0 {
             let ratio = ms.vol_1m / avg_1m_baseline;
+            let vol_1m_snap = ms.vol_1m; // capture before drop
             let sig_id = format!("velocity-{}", slug);
             drop(mss); // release before locking dedup
             if state.signal_dedup.lock().unwrap().should_fire(&sig_id, now, 120_000) {
@@ -1162,8 +1168,8 @@ fn run_signals_on_trade(state: &Arc<AppState>, trade: &Trade) {
                 state.fire_edge_signal(EdgeSignal {
                     id: sig_id, kind: "VELOCITY_SURGE".into(),
                     title: "VELOCITY SURGE".into(),
-                    description: format!("{:.1}× volume spike vs 60-min avg. ${:.0}K in last 60s.",
-                        ratio, trade.size_usd / 1000.0),
+                    description: format!("{:.1}× volume spike vs 60-min avg. ${:.0}K vol in last 60s.",
+                        ratio, vol_1m_snap / 1000.0),
                     market: trade.market.clone(), market_slug: slug.clone(),
                     outcome: trade.outcome_name.clone(),
                     price_cents: trade.price_cents, confidence: conf,
@@ -1277,7 +1283,12 @@ fn run_signals_on_trade(state: &Arc<AppState>, trade: &Trade) {
     // Edge: thin ask book = price can move up with small additional buying.
     {
         let books = state.raw_books.lock().unwrap();
-        if let Some(rb) = books.get(&trade.outcome_name) { // approximate lookup
+        // Must look up by token_id, not outcome_name. Resolve token_id from asset_map.
+        let token_id_opt = state.asset_map.read().unwrap().get(&trade.condition_id).copied()
+            .and_then(|(mi, oi)| state.markets.read().unwrap().get(mi)
+                .and_then(|m| m.outcomes.get(oi)).map(|o| o.token_id.clone()));
+        if let Some(token_id) = token_id_opt {
+        if let Some(rb) = books.get(&token_id) {
             let ask_liq: f64 = rb.asks.iter().map(|(p,s)| s*(p/100.0)).sum();
             drop(books);
 
@@ -1313,6 +1324,7 @@ fn run_signals_on_trade(state: &Arc<AppState>, trade: &Trade) {
                 } else { drop(mss); }
             } else { drop(mss); }
         }
+        } // closes if let Some(token_id)
     }
 
     // ── 8. MOMENTUM BREAK ────────────────────────────────────────────────────
@@ -1579,13 +1591,24 @@ async fn task_data_trades(state: Arc<AppState>, client: reqwest::Client) {
                 let mut mkts = state.markets.write().unwrap();
                 if let Some(m) = mkts.get_mut(mi) {
                     if let Some(o) = m.outcomes.get_mut(oi) { o.price_cents = price_cents; o.last_trade = price_cents; }
-                    m.prob_change_pct = price_cents - old_price;
-                    m.volume_24h += size_usd;
+                    // Store last-known price for windowed change; do not use single-tick delta as "trend"
+                    // prob_change_pct = price now vs price 5 min ago (maintained by task_signals)
+                    // Only update last_trade price here; task_signals computes windowed delta.
+                    m.prob_change_pct = price_cents - old_price; // single-tick delta kept for PriceUpdate event only
+                    // Do NOT add live trades to API snapshot volume — they would double-count.
+                    // volume_24h is authoritative from load_markets(). Track live separately via stats.
+                    // m.volume_24h += size_usd;  ← REMOVED
                     let avg_vol = mkts.iter().map(|x| x.volume_24h).sum::<f64>() / mkts.len().max(1) as f64;
                     if let Some(m2) = mkts.get_mut(mi) {
                         m2.signal = classify_signal(m2.prob_change_pct, m2.volume_24h, avg_vol).into();
-                        if action == Action::BUY { m2.buy_pressure = (m2.buy_pressure * 0.97 + 0.03).min(1.0); }
-                        else { m2.buy_pressure = (m2.buy_pressure * 0.97).max(0.0); }
+                        // Symmetric: BUY pushes toward 1.0, SELL pushes toward 0.0
+                        // Weight = size_usd normalised to max ~$50K
+                        let weight = (size_usd / 50_000.0).min(0.05).max(0.005);
+                        if action == Action::BUY {
+                            m2.buy_pressure = (m2.buy_pressure * (1.0 - weight) + weight).min(1.0);
+                        } else {
+                            m2.buy_pressure = (m2.buy_pressure * (1.0 - weight)).max(0.0);
+                        }
                     }
                     let (sig, vol) = if mi < mkts.len() { (mkts[mi].signal.clone(), mkts[mi].volume_24h) } else { ("NEUTRAL".into(), 0.0) };
                     let _ = state.tx.send(Ev::PriceUpdate {
@@ -1599,10 +1622,11 @@ async fn task_data_trades(state: Arc<AppState>, client: reqwest::Client) {
             // ── Update whale profile ──────────────────────────────────────────
             let profile_updated = {
                 let mut profiles = state.whale_profiles.lock().unwrap();
-                let pnl_this_trade = match action {
-                    Action::BUY  =>  size_usd * (0.5 - price).abs() * 0.25,
-                    Action::SELL => -size_usd * 0.012,
-                };
+                // Symmetric proxy: BUY at price < 0.5 = bullish edge; SELL at price > 0.5 = bullish edge.
+                // Both positive when trading with the smart side. Negative when against it.
+                // If no reliable PnL model, set 0.0 rather than fabricate.
+                // For now: use a neutral proxy that doesn't bias win_rate.
+                let pnl_this_trade = 0.0_f64; // Removed misleading asymmetric proxy
                 let p = profiles.entry(wallet.clone()).or_insert_with(|| WhaleProfile {
                     wallet: wallet.clone(), wallet_short: shorten_addr(&wallet),
                     pseudonym: pseudonym.clone(),
@@ -1630,27 +1654,29 @@ async fn task_data_trades(state: Arc<AppState>, client: reqwest::Client) {
                 p.clone()
             };
 
+            // ── Store FIRST (so buy_sell_ratio includes this trade) ───────────
+            { let mut td = state.recent_trades.lock().unwrap(); td.push_front(trade.clone()); if td.len()>MAX_TRADES{td.pop_back();} }
+
             // ── Signal engine ────────────────────────────────────────────────
             run_signals_on_trade(&state, &trade);
 
             // ── Stats ────────────────────────────────────────────────────────
             {
                 let mut s = state.stats.lock().unwrap();
-                s.total_trades_seen += 1; s.total_volume_24h += size_usd;
+                s.total_trades_seen += 1;
+                // Note: total_volume_24h is authoritative from load_markets; don't accumulate here
                 if size_usd > s.biggest_trade { s.biggest_trade = size_usd; }
                 let profiles = state.whale_profiles.lock().unwrap();
                 s.whale_count    = profiles.values().filter(|p| p.total_volume >= WHALE_USD).count();
                 s.alpha_wallet_count = profiles.values().filter(|p| p.whale_score >= 70.0).count();
                 s.active_wallets = profiles.len();
                 drop(profiles);
+                // buy_sell_ratio now includes the trade just inserted above
                 let trades = state.recent_trades.lock().unwrap();
                 let (bv, sv) = trades.iter().fold((0.0_f64,0.0_f64),|(b,s),t| match t.action {
                     Action::BUY  => (b+t.size_usd, s), Action::SELL => (b, s+t.size_usd) });
                 s.buy_sell_ratio = if sv > 0.0 { bv/sv } else { 1.0 };
             }
-
-            // ── Store + broadcast ────────────────────────────────────────────
-            { let mut td = state.recent_trades.lock().unwrap(); td.push_front(trade.clone()); if td.len()>MAX_TRADES{td.pop_back();} }
 
             let _ = state.tx.send(Ev::Trade(trade.clone()));
             let _ = state.tx.send(Ev::WhaleUpdate(profile_updated));
@@ -1786,7 +1812,7 @@ fn assemble_book(state: &Arc<AppState>, m: &Market) -> MarketBook {
                 price: *p, size: s*(p/100.0), fill_pct: ((s/max_s)*100.0).min(100.0) as u8
             }).collect();
             (lvls, liq)
-        } else { (synth_levels(current, true), 0.0) };
+        } else { (vec![], 0.0) }; // No real book → empty, never fake
 
         let (asks, ask_liq) = if let Some(b) = rb {
             let liq: f64 = b.asks.iter().map(|(p,s)| s*(p/100.0)).sum();
@@ -1795,7 +1821,7 @@ fn assemble_book(state: &Arc<AppState>, m: &Market) -> MarketBook {
                 price: *p, size: s*(p/100.0), fill_pct: ((s/max_s)*100.0).min(100.0) as u8
             }).collect();
             (lvls, liq)
-        } else { (synth_levels(current, false), 0.0) };
+        } else { (vec![], 0.0) }; // No real book → empty, never fake
 
         let mut bids = bids; bids.sort_by(|a,b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
         let mut asks = asks; asks.sort_by(|a,b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
@@ -1818,15 +1844,6 @@ fn assemble_book(state: &Arc<AppState>, m: &Market) -> MarketBook {
     MarketBook { market_id: m.id, condition_id: m.condition_id.clone(), outcome_books, total_liquidity: total_liq, dominant_side: dominant, ts }
 }
 
-fn synth_levels(base: f64, is_bid: bool) -> Vec<Level> {
-    let mut rng = rand::thread_rng();
-    (0..6usize).map(|i| {
-        let price = if is_bid { (base - 0.5 - i as f64 * rng.gen_range(0.8..1.8)).clamp(1.0, 99.0) }
-                    else      { (base + 0.5 + i as f64 * rng.gen_range(0.8..1.8)).clamp(1.0, 99.0) };
-        let size = rng.gen_range(300.0_f64..15_000.0) / (i as f64 + 1.0).sqrt();
-        Level { price, size, fill_pct: (90 / (i as u8 + 1)).min(100) }
-    }).collect()
-}
 
 // ─── Task: Leaderboards ────────────────────────────────────────────────────────
 
@@ -1868,7 +1885,29 @@ async fn task_signals(state: Arc<AppState>) {
         if mkts.is_empty() { continue; }
 
         let n = mkts.len() as f64;
-        let bullish = mkts.iter().filter(|m| m.prob_change_pct > 0.0).count() as f64;
+        // Use 5m-windowed price change, not single-tick delta
+        let now_ms = Utc::now().timestamp_millis();
+        {
+            let mut mss = state.mkt_signal_state.lock().unwrap();
+            for m in mkts.iter() {
+                let ms = mss.entry(m.slug.clone()).or_default();
+                let price = m.primary_prob();
+                if ms.price_5m_ts == 0 || (now_ms - ms.price_5m_ts) >= 300_000 {
+                    ms.price_5m_ago = price;
+                    ms.price_5m_ts  = now_ms;
+                }
+                if ms.price_15m_ts == 0 || (now_ms - ms.price_15m_ts) >= 900_000 {
+                    ms.price_15m_ago = price;
+                    ms.price_15m_ts  = now_ms;
+                }
+            }
+        }
+        let bullish = {
+            let mss = state.mkt_signal_state.lock().unwrap();
+            mkts.iter().filter(|m| {
+                mss.get(&m.slug).map(|ms| m.primary_prob() > ms.price_5m_ago).unwrap_or(false)
+            }).count() as f64
+        };
         let momentum = (bullish / n * 100.0) as u8;
         let total_vol = mkts.iter().map(|m| m.volume_24h).sum::<f64>();
         let volume = (total_vol / 5_000_000.0 * 100.0).min(100.0) as u8;
@@ -1884,47 +1923,23 @@ async fn task_signals(state: Arc<AppState>) {
 
         // ── Enhanced recommendation with detail ───────────────────────────────
         let rec_probability = composite;
+        // Recommendation MUST derive ONLY from composite. No overrides.
         let (recommendation, rec_detail, rec_signal_type) = {
-            // Check for recent whale accumulation pattern
-            let recent_whale_trades: Vec<_> = trades.iter().take(100)
-                .filter(|t| t.is_whale && t.action == Action::BUY)
-                .collect();
-            let recent_window_secs = 90i64;
-            let now_ms = Utc::now().timestamp_millis();
-            let window_cutoff = now_ms - recent_window_secs * 1000;
-            let whales_in_window: std::collections::HashSet<_> = recent_whale_trades.iter()
-                .filter(|t| t.ts >= window_cutoff)
-                .map(|t| &t.wallet)
-                .collect();
-
-            if whales_in_window.len() >= 3 {
-                let hottest = recent_whale_trades.first()
-                    .map(|t| t.outcome_name.as_str()).unwrap_or("YES");
-                (
-                    format!("STRONG BUY {}", hottest),
-                    format!("Whale accumulation detected ({} whales, {}s window)", whales_in_window.len(), recent_window_secs),
-                    "whale_accum".to_string(),
-                )
-            } else if composite >= 72 {
-                (
-                    format!("HIGH PROB YES ({}%)", rec_probability),
-                    "Broad bullish momentum across markets".to_string(),
-                    "momentum".to_string(),
-                )
-            } else if composite <= 28 {
-                (
-                    "EXHAUSTION SIGNAL".to_string(),
-                    "Exhaustion signal after volume spike — reversal likely".to_string(),
-                    "exhaustion".to_string(),
-                )
-            } else {
-                let base = match composite {
-                    0..=20  => "EXTREME BEAR", 21..=35 => "STRONG BEAR", 36..=45 => "BEARISH",
-                    46..=55 => "NEUTRAL",      56..=65 => "BULLISH",      66..=80 => "STRONG BULL",
-                    _       => "EXTREME BULL",
-                };
-                (base.to_string(), format!("Composite score {}/100", composite), "composite".to_string())
-            }
+            let base = match composite {
+                0..=20  => "EXTREME BEAR",
+                21..=35 => "STRONG BEAR",
+                36..=45 => "BEARISH",
+                46..=55 => "NEUTRAL",
+                56..=65 => "BULLISH",
+                66..=80 => "STRONG BULL",
+                _       => "EXTREME BULL",
+            };
+            (
+                base.to_string(),
+                format!("Composite score {}/100 (momentum={} volume={} sentiment={} whale_flow={})",
+                    composite, momentum, volume, sentiment, whale_flow),
+                "composite".to_string(),
+            )
         };
 
         let confidence_score = {
@@ -1948,11 +1963,7 @@ async fn task_signals(state: Arc<AppState>) {
             }).collect()
         };
 
-        // ── Time-based projections (based on momentum/volume) ─────────────────
-        let base_move = (composite as f64 - 50.0).abs() / 10.0; // 0-5 cents expected
-        let proj_5m  = if composite != 50 { Some(base_move * 0.3) } else { None };
-        let proj_30m = if composite != 50 { Some(base_move * 1.2) } else { None };
-        let proj_1h  = if composite != 50 { Some(base_move * 2.5) } else { None };
+        // Projections removed
 
         // ── Whale follow yield (average ROI of top 10 whales) ─────────────────
         let whale_follow_yield: f64 = {
@@ -1978,9 +1989,7 @@ async fn task_signals(state: Arc<AppState>) {
         {
             let mut s = state.stats.lock().unwrap();
             s.whale_follow_yield = whale_follow_yield;
-            let fired = s.signals_fired_today;
-            s.signals_7d  = fired * 7;   // approximate
-            s.signals_30d = fired * 30;
+            // signals_7d / signals_30d removed — fabricated data
         }
 
         let sig = GlobalSignals {
@@ -1988,7 +1997,7 @@ async fn task_signals(state: Arc<AppState>) {
             recommendation, rec_probability, rec_detail, rec_signal_type,
             confidence_score, signal_accuracy,
             top_market: top_mkt, hottest_outcome: hottest,
-            proj_5m, proj_30m, proj_1h, whale_follow_yield,
+            whale_follow_yield,
         };
         *state.signals.lock().unwrap() = sig.clone();
         let _ = state.tx.send(Ev::Signals(sig));
