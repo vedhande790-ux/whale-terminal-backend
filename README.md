@@ -4,9 +4,7 @@ Live Polymarket whale-tracking engine in Rust — ingests real trades and order 
 detects smart-money flow with an 8-signal detection engine, and streams it to a
 terminal dashboard over WebSocket + REST.
 
-![Whale Terminal UI](docs/screenshot.png)
-
-> Save the UI screenshot as `docs/screenshot.png` to render the image above.
+![Whale Terminal UI](screenshot.png)
 
 ## What it does
 
@@ -89,11 +87,6 @@ curl http://localhost:8080/api/stats
 `axum` (HTTP + WebSocket) · `tokio` (async runtime, broadcast fan-out) ·
 `tower-http` (CORS, static file) · `reqwest` + `tokio-tungstenite` (Polymarket
 REST + WS clients) · `serde` / `serde_json` · `chrono` · `rand` · `uuid`
-
-## Docs
-
-Design notes live in [`docs/`](docs/): `architecture.md`,
-`ARCHITECTURE_WALKTHROUGH.md`, `TRADES_PIPELINE.md`, `SIGNAL_ENGINE_NOTES.md`.
 
 ## Author
 
